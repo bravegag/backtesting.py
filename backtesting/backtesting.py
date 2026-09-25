@@ -865,7 +865,7 @@ class _Broker:
 
     def next(self, process_orders: bool = True):
         # Reset cached value here due to price change on every bar
-        self.__dict__.pop(self.__class__._position_unrealized_pl.func.__name__, None)
+        self.__dict__.pop(self.__class__._position_unrealized_pl.func.__name__, None)  # type: ignore[attr-defined]
 
         i = self._i = len(self._data) - 1
         if process_orders:
