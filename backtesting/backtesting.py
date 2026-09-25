@@ -852,12 +852,13 @@ class _Broker:
         margin_used = sum(trade.value / self._leverage for trade in self.trades)
         return max(0, self.equity - margin_used)
 
-    def next(self):
+    def next(self, process_orders: bool = True):
         # Reset cached value here due to price change on every bar
         self.__dict__.pop(self.__class__._position_unrealized_pl.func.__name__, None)
 
         i = self._i = len(self._data) - 1
-        self._process_orders()
+        if process_orders:
+            self._process_orders()
 
         # Log account equity for the equity curve
         equity = self.equity
@@ -1314,9 +1315,12 @@ class Backtest:
         .. warning::
             You may obtain different results for different strategy parameters.
             E.g. if you use 50- and 200-bar SMA, the trading simulation will
-            begin on bar 201. The actual length of delay is equal to the lookback
-            period of the `Strategy.I` indicator which lags the most.
-            Obviously, this can affect results.
+            begin on bar 200, the first bar on which every indicator is valid;
+            without indicators, `Strategy.next()` is called from the first bar.
+            The actual length of delay is equal to the lookback period of the
+            `Strategy.I` indicator which lags the most. Obviously, this can
+            affect results. Orders placed in `Strategy.next()` are filled on the
+            following bar (or at the deciding bar's close with `trade_on_close`).
         """
         data = _Data(self._data.copy(deep=False))
         broker: _Broker = self._broker(data=data)
@@ -1328,9 +1332,10 @@ class Backtest:
         # Indicators used in Strategy.next()
         indicator_attrs = _strategy_indicators(strategy)
 
-        # Skip first few candles where indicators are still "warming up"
-        # +1 to have at least two entries available
-        start = 1 + _indicator_warmup_nbars(strategy)
+        # Skip first few candles where indicators are still "warming up"; `next()` then starts on the first bar where
+        # every indicator is valid (bar 0 without warm-up). No extra bar is needed: the broker processes an order on
+        # the bar after the one it was placed on, so the first decision cannot fill with its own bar's prices.
+        start = _indicator_warmup_nbars(strategy)
 
         # Disable "invalid value encountered in ..." warnings. Comparison
         # np.nan >= 3 is not invalid; it's False.
@@ -1344,9 +1349,11 @@ class Backtest:
                     # Slice indicator on the last dimension (case of 2d indicator)
                     setattr(strategy, attr, indicator[..., :i + 1])
 
-                # Handle orders processing and broker stuff
+                # Handle orders processing and broker stuff. On the first simulation bar only orders placed in
+                # `Strategy.init()` can be pending; they are first processed on the following bar (its open, or this
+                # bar's close with `trade_on_close`), exactly as when `next()` started one bar later.
                 try:
-                    broker.next()
+                    broker.next(process_orders=i > start)
                 except _OutOfMoneyError:
                     break
 

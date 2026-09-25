@@ -254,6 +254,8 @@ class TestBacktest(TestCase):
                 self.done = False
 
             def next(self):
+                if len(self.data) < ORDER_BAR:  # place the order on bar ORDER_BAR - 1
+                    return
                 if not self.position:
                     self.buy()
                 else:
@@ -565,6 +567,7 @@ class TestStrategy(TestCase):
 
     def test_stop_limit_order_price_is_stop_price(self):
         def coroutine(self):
+            yield  # place both orders on the second bar
             self.buy(stop=112, limit=113, size=1)
             self.sell(stop=107, limit=105, size=1)
             yield
@@ -674,6 +677,134 @@ class TestOptimize(TestCase):
         print(end - start)
         handicap = 5 if 'win' in sys.platform else .1
         self.assertLess(end - start, .3 + handicap)
+
+
+class TestFirstBarExecution(TestCase):
+    """`Strategy.next()` runs on the earliest bar where every indicator is valid, including bar 0.
+
+    Orders decided on a bar are processed by the broker on the following bar only, so deciding on the first bar never
+    fills with prices of that same bar (except `trade_on_close`, which by definition fills at the deciding bar's close).
+    """
+    DATA = SHORT_DATA.iloc[:6]
+
+    @staticmethod
+    def _run(decide, data=None, **kwargs):
+        calls = []
+
+        class S(Strategy):
+            def init(self):
+                pass
+
+            def next(self):
+                calls.append(len(self.data) - 1)
+                decide(self, len(self.data) - 1)
+
+        stats = Backtest(TestFirstBarExecution.DATA if data is None else data, S, **kwargs).run()
+        return stats, calls
+
+    def test_next_is_called_on_the_first_bar_without_indicators(self):
+        _, calls = self._run(lambda strategy, bar: None)
+        self.assertEqual(calls, list(range(len(self.DATA))))
+
+    def test_first_bar_market_order_fills_at_the_next_open(self):
+        def decide(strategy, bar):
+            if bar == 0:
+                strategy.buy(size=1)
+
+        stats, _ = self._run(decide)
+        trade = stats._trades.iloc[0]
+        self.assertEqual(trade.EntryBar, 1)
+        self.assertEqual(trade.EntryPrice, self.DATA.Open.iloc[1])
+        self.assertEqual(stats._equity_curve.Equity.iloc[0], 10_000)  # nothing filled on the deciding bar
+
+    def test_first_bar_limit_stop_and_bracket_orders_are_evaluated_from_the_next_bar(self):
+        first = self.DATA.iloc[0]
+        self.assertTrue((self.DATA.Low.iloc[1:] > first.Low).all())  # only bar 0 itself reaches its low
+
+        def run(place):
+            return self._run(lambda strategy, bar: place(strategy) if bar == 0 else None)[0]._trades
+
+        # a limit the deciding bar's own low satisfies must not fill with that bar's prices
+        self.assertTrue(run(lambda strategy: strategy.buy(size=1, limit=first.Low)).empty)
+        # a stop the deciding bar's own high reached triggers only on a later bar, at that bar's prices
+        second = self.DATA.iloc[1]
+        self.assertGreaterEqual(second.High, first.High)
+        stop = run(lambda strategy: strategy.buy(size=1, stop=first.High)).iloc[0]
+        self.assertEqual((stop.EntryBar, stop.EntryPrice), (1, max(second.Open, first.High)))
+        self.assertTrue(run(lambda strategy: strategy.buy(size=1, stop=self.DATA.High.max() + 1)).empty)
+        bracket = run(lambda strategy: strategy.buy(size=1, sl=first.Low * .5, tp=first.High * 2)).iloc[0]
+        self.assertEqual((bracket.EntryBar, bracket.EntryPrice), (1, self.DATA.Open.iloc[1]))
+
+    def test_warm_up_still_delays_next_until_every_indicator_is_valid(self):
+        seen = []
+
+        class S(Strategy):
+            def init(self):
+                self.sma = self.I(SMA, self.data.Close, 3)
+
+            def next(self):
+                seen.append((len(self.data) - 1, self.sma[-1]))
+
+        Backtest(self.DATA, S).run()
+        self.assertEqual(seen[0][0], 2)  # SMA(3) is first valid on bar 2
+        self.assertTrue(all(np.isfinite(value) for _, value in seen))
+
+    def test_trade_on_close_fills_a_first_bar_decision_at_that_bar_close(self):
+        def decide(strategy, bar):
+            if bar in (0, 2):
+                strategy.buy(size=1)
+
+        stats, _ = self._run(decide, trade_on_close=True)
+        first, later = stats._trades.iloc[0], stats._trades.iloc[1]
+        self.assertEqual((first.EntryBar, first.EntryPrice), (0, self.DATA.Close.iloc[0]))
+        self.assertEqual((later.EntryBar, later.EntryPrice), (2, self.DATA.Close.iloc[2]))
+
+    def test_first_bar_reversal_behaves_like_any_later_bar(self):
+        def decide(strategy, bar):
+            if bar == 0:
+                strategy.buy()
+            elif bar == 1:
+                strategy.sell()
+
+        stats, _ = self._run(decide, exclusive_orders=True)
+        long_trade, short_trade = stats._trades.iloc[0], stats._trades.iloc[1]
+        self.assertEqual((long_trade.EntryBar, long_trade.ExitBar), (1, 2))
+        self.assertGreater(long_trade.Size, 0)
+        self.assertEqual((short_trade.EntryBar, short_trade.EntryPrice), (2, self.DATA.Open.iloc[2]))
+        self.assertLess(short_trade.Size, 0)
+
+    def test_orders_placed_in_init_keep_their_fill_timing_after_indicator_warm_up(self):
+        # SMA(3) is first valid on bar 2, so next() starts there; an init() order is first processed on the
+        # following simulation bar, exactly as when next() started one bar after the warm-up
+        warm_up = 2
+        for trade_on_close, entry_bar, price in ((False, warm_up + 1, self.DATA.Open.iloc[warm_up + 1]),
+                                                 (True, warm_up, self.DATA.Close.iloc[warm_up])):
+            seen = []
+
+            class S(Strategy):
+                def init(self):
+                    self.sma = self.I(SMA, self.data.Close, 3)
+                    self.buy(size=1)
+
+                def next(self):
+                    seen.append(len(self.data) - 1)
+
+            trade = Backtest(self.DATA, S, trade_on_close=trade_on_close).run()._trades.iloc[0]
+            self.assertEqual(seen[0], warm_up)
+            self.assertEqual((trade.EntryBar, trade.EntryPrice), (entry_bar, price))
+
+    def test_orders_placed_in_init_keep_filling_on_the_second_bar(self):
+        for trade_on_close, price in ((False, self.DATA.Open.iloc[1]), (True, self.DATA.Close.iloc[0])):
+            class S(Strategy):
+                def init(self):
+                    self.buy(size=1)
+
+                def next(self):
+                    pass
+
+            trade = Backtest(self.DATA, S, trade_on_close=trade_on_close).run()._trades.iloc[0]
+            self.assertEqual(trade.EntryPrice, price)
+            self.assertEqual(trade.EntryBar, 0 if trade_on_close else 1)
 
 
 class TestPlot(TestCase):
@@ -1203,6 +1334,7 @@ class TestRegressions(TestCase):
 
     def test_trade_on_close_closes_trades_on_close(self):
         def coro(strat):
+            yield  # decide on the second bar
             yield strat.buy(size=1, sl=90) and strat.buy(size=1, sl=80)
             assert len(strat.trades) == 2
             yield strat.trades[0].close()
